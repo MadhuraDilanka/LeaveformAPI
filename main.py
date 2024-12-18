@@ -16,6 +16,8 @@ from datetime import datetime
 import re
 from dateutil import parser
 import pytz
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 # Configure detailed logging
 logging.basicConfig(
@@ -208,32 +210,31 @@ def standardize_date_format(date_str: str, output_format: str = "%d/%m/%y") -> s
         raise DateParsingError(f"Date parsing failed: {str(e)}")
 
 async def extract_first_page(file_content: bytes) -> Optional[str]:
-    """Extract first page from PDF and return it as base64 encoded string."""
+    """Extract first page from PDF and return as a thumbnail image in base64 encoded string."""
     def _extract():
         try:
             logger.info(f"Starting PDF first page extraction for document of size {len(file_content)} bytes")
             
-            # Create PDF reader object from bytes
-            pdf_reader = PdfReader(io.BytesIO(file_content))
+            # Convert first page to image
+            images = convert_from_bytes(file_content, first_page=0, last_page=1)
             
-            if len(pdf_reader.pages) > 0:
-                # Create a new PDF writer object
-                pdf_writer = PdfWriter()
+            if images:
+                # Get the first image
+                first_page = images[0]
                 
-                # Add only the first page
-                pdf_writer.add_page(pdf_reader.pages[0])
+                # Create thumbnail (e.g., with max dimension of 300px while maintaining aspect ratio)
+                max_size = (300, 300)
+                first_page.thumbnail(max_size, Image.Resampling.LANCZOS)
                 
-                # Write to bytes buffer
-                output_buffer = io.BytesIO()
-                pdf_writer.write(output_buffer)
+                # Save thumbnail to bytes buffer
+                img_buffer = io.BytesIO()
+                first_page.save(img_buffer, format='PNG', optimize=True)
+                thumbnail = base64.b64encode(img_buffer.getvalue()).decode()
                 
-                # Get the value and encode to base64
-                first_page_pdf = base64.b64encode(output_buffer.getvalue()).decode()
-                
-                logger.info("Successfully extracted first page from PDF")
-                return first_page_pdf
+                logger.info("Successfully extracted and thumbnailed first page from PDF")
+                return thumbnail
             else:
-                logger.warning("PDF document is empty")
+                logger.warning("Failed to convert PDF page to image")
                 return None
                 
         except Exception as e:
@@ -268,7 +269,6 @@ async def process_form_recognizer(file_content: bytes, filename: str) -> Dict:
                             logger.info(f"Successfully standardized date: {value}")
                         except DateParsingError as e:
                             logger.warning(f"Date parsing failed for {value}: {str(e)}")
-                            # Keep original value if parsing fails
                     
                     extracted_data[mapped_key] = {
                         'value': value,
@@ -304,18 +304,18 @@ async def process_document(
         
         # Process form recognition and first page extraction concurrently
         extracted_data_task = process_form_recognizer(file_content, file.filename)
-        first_page_task = extract_first_page(file_content)
+        thumbnail_task = extract_first_page(file_content)
         
         # Wait for both tasks to complete
-        extracted_data, first_page = await asyncio.gather(
+        extracted_data, thumbnail = await asyncio.gather(
             extracted_data_task,
-            first_page_task
+            thumbnail_task
         )
         
         response_data = {
             "filename": file.filename,
             "extracted_data": extracted_data,
-            "first_page": first_page,
+            "thumbnail": thumbnail,
             "metadata": metadata_dict
         }
         
@@ -353,17 +353,17 @@ async def process_documents_batch(
                 
                 # Process form recognition and first page extraction concurrently
                 extracted_data_task = process_form_recognizer(file_content, file.filename)
-                first_page_task = extract_first_page(file_content)
+                thumbnail_task = extract_first_page(file_content)
                 
-                extracted_data, first_page = await asyncio.gather(
+                extracted_data, thumbnail = await asyncio.gather(
                     extracted_data_task,
-                    first_page_task
+                    thumbnail_task
                 )
                 
                 return {
                     "filename": file.filename,
                     "extracted_data": extracted_data,
-                    "first_page": first_page,
+                    "thumbnail": thumbnail,
                     "metadata": metadata_dict,
                     "status": "success"
                 }
@@ -425,8 +425,6 @@ async def health_check():
             detail=f"Service unhealthy: {str(e)}"
         )
 
-
-
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting FastAPI application")
@@ -437,9 +435,3 @@ if __name__ == "__main__":
         log_level="info",
         # reload=True  # Enable auto-reload during development
     )
-
-
-
-
-
-    
