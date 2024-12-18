@@ -24,7 +24,7 @@ app = FastAPI()
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,7 +36,7 @@ document_analysis_client = DocumentAnalysisClient(
     credential=AzureKeyCredential(os.getenv("AZURE_KEY"))
 )
 
-ENADOC_BASE_URL = "https://qaenadoc.enadocapp.com/api"
+ENADOC_BASE_URL = "https://enadocapp.com/api"
 
 # Define field mappings
 FIELD_MAPPINGS = {
