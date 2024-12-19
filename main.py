@@ -215,34 +215,57 @@ async def extract_first_page(file_content: bytes) -> Optional[str]:
         try:
             logger.info(f"Starting PDF first page extraction for document of size {len(file_content)} bytes")
             
-            # Convert first page to image
-            images = convert_from_bytes(file_content, first_page=0, last_page=1)
+            # Convert first page to image with specific DPI setting
+            images = convert_from_bytes(
+                file_content,
+                first_page=1,  # pdf2image uses 1-based indexing
+                last_page=1,
+                dpi=200,  # Increased DPI for better quality
+                fmt='PNG',
+                poppler_path=None  # Set this to your poppler path if needed
+            )
             
-            if images:
-                # Get the first image
-                first_page = images[0]
-                
-                # Create thumbnail (e.g., with max dimension of 300px while maintaining aspect ratio)
-                max_size = (300, 300)
-                first_page.thumbnail(max_size, Image.Resampling.LANCZOS)
-                
-                # Save thumbnail to bytes buffer
-                img_buffer = io.BytesIO()
-                first_page.save(img_buffer, format='PNG', optimize=True)
-                thumbnail = base64.b64encode(img_buffer.getvalue()).decode()
-                
-                logger.info("Successfully extracted and thumbnailed first page from PDF")
-                return thumbnail
-            else:
-                logger.warning("Failed to convert PDF page to image")
+            if not images:
+                logger.error("No images were converted from PDF")
                 return None
+            
+            # Get the first image
+            first_page = images[0]
+            
+            # Create thumbnail with specific size while maintaining aspect ratio
+            max_size = (800, 800)  # Increased size for better visibility
+            first_page.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            # Save thumbnail to bytes buffer with optimal compression
+            img_buffer = io.BytesIO()
+            first_page.save(
+                img_buffer,
+                format='PNG',
+                optimize=True,
+                quality=85  # Adjust quality for better compression
+            )
+            img_buffer.seek(0)
+            
+            # Convert to base64
+            thumbnail = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            
+            if not thumbnail:
+                logger.error("Generated thumbnail is empty")
+                return None
+                
+            logger.info(f"Successfully generated thumbnail of size: {len(thumbnail)} bytes")
+            return thumbnail
                 
         except Exception as e:
             logger.error(f"PDF extraction error: {str(e)}", exc_info=True)
-            return None
+            raise Exception(f"Failed to generate thumbnail: {str(e)}")
 
-    return await asyncio.get_event_loop().run_in_executor(executor, _extract)
-
+    try:
+        return await asyncio.get_event_loop().run_in_executor(executor, _extract)
+    except Exception as e:
+        logger.error(f"Thumbnail generation failed: {str(e)}")
+        return None
+    
 async def process_form_recognizer(file_content: bytes, filename: str) -> Dict:
     """Process document with Form Recognizer and map field names."""
     try:
