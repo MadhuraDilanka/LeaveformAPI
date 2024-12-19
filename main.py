@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import List, Dict, Optional, Union
 import json
 import asyncio
@@ -38,18 +39,17 @@ missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
     raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
-logger.info(f"Azure Endpoint: {os.getenv('AZURE_ENDPOINT')}")
-logger.info(f"Azure Key is {'set' if os.getenv('AZURE_KEY') else 'not set'}")
-
 app = FastAPI()
 
-# CORS configuration
+# Updated CORS configuration allowing all origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # Must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # Azure Configuration
@@ -63,7 +63,10 @@ except Exception as e:
     logger.error(f"Failed to initialize Document Analysis Client: {str(e)}")
     raise
 
-# Define field mappings
+# Initialize ThreadPoolExecutor for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Field mappings
 FIELD_MAPPINGS = {
     "I.D. No.": "ID Number",
     "Employee Name": "Employee Name",
@@ -72,29 +75,19 @@ FIELD_MAPPINGS = {
 }
 
 KEYS_OF_INTEREST = list(FIELD_MAPPINGS.keys())
-logger.info(f"Configured field mappings: {FIELD_MAPPINGS}")
-
-# Initialize ThreadPoolExecutor for CPU-bound tasks
-executor = ThreadPoolExecutor(max_workers=4)
 
 class DateParsingError(Exception):
     """Custom exception for date parsing errors"""
     pass
 
 def clean_date_string(date_str: str) -> str:
-    """
-    Clean and normalize date string before parsing.
-    """
+    """Clean and normalize date string before parsing."""
     if not date_str:
         raise DateParsingError("Empty date string")
     
-    # Convert to string if not already
     date_str = str(date_str).strip()
-    
-    # Remove any extra spaces
     date_str = re.sub(r'\s+', ' ', date_str)
     
-    # Replace common written months with numeric
     month_replacements = {
         'january': '01', 'jan': '01',
         'february': '02', 'feb': '02',
@@ -115,51 +108,25 @@ def clean_date_string(date_str: str) -> str:
         if month_str in lower_date:
             lower_date = lower_date.replace(month_str, month_num)
     
-    # Remove any non-alphanumeric characters except spaces and common separators
     cleaned = re.sub(r'[^\w\s/-]', '', lower_date)
-    
     return cleaned
 
 def standardize_date_format(date_str: str, output_format: str = "%d/%m/%y") -> str:
-    """
-    Convert various date formats to specified output format (default: dd/mm/yy).
-    Handles a wide variety of input formats.
-    """
+    """Convert various date formats to specified output format."""
     try:
-        # Clean and normalize the date string
         cleaned_date = clean_date_string(date_str)
         
-        # Common date formats to try
         date_formats = [
-            # Standard formats
             "%d/%m/%y", "%d/%m/%Y",
             "%m/%d/%y", "%m/%d/%Y",
             "%Y-%m-%d", "%d-%m-%Y",
             "%Y/%m/%d", "%d/%m/%Y",
-            
-            # Formats with month names
             "%d %m %Y", "%m %d %Y",
             "%Y %m %d", "%d %b %Y",
-            "%b %d %Y", "%d %B %Y",
-            "%B %d %Y",
-            
-            # Formats with time
-            "%Y-%m-%d %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S",
-            "%m/%d/%Y %H:%M:%S",
-            "%Y/%m/%d %H:%M:%S",
-            
-            # ISO format
             "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S.%f",
-            "%Y-%m-%dT%H:%M:%SZ",
-            
-            # Additional formats
-            "%Y%m%d", "%d%m%Y",
-            "%m%d%Y", "%Y%m%d%H%M%S",
+            "%Y%m%d"
         ]
         
-        # Try parsing with explicit formats first
         for fmt in date_formats:
             try:
                 parsed_date = datetime.strptime(cleaned_date, fmt)
@@ -167,42 +134,10 @@ def standardize_date_format(date_str: str, output_format: str = "%d/%m/%y") -> s
             except ValueError:
                 continue
         
-        # If explicit formats fail, try dateutil parser
         try:
             parsed_date = parser.parse(cleaned_date)
             return parsed_date.strftime(output_format)
         except (ValueError, parser.ParserError):
-            # Last resort: try to extract dates using regex
-            date_patterns = [
-                r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})',  # dd/mm/yyyy or mm/dd/yyyy
-                r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',    # yyyy/mm/dd
-                r'(\d{8})',                               # YYYYMMDD
-            ]
-            
-            for pattern in date_patterns:
-                match = re.search(pattern, cleaned_date)
-                if match:
-                    groups = match.groups()
-                    if len(groups[0]) == 4:  # yyyy/mm/dd format
-                        try:
-                            return datetime(
-                                int(groups[0]),
-                                int(groups[1]),
-                                int(groups[2])
-                            ).strftime(output_format)
-                        except ValueError:
-                            continue
-                    else:  # dd/mm/yyyy or mm/dd/yyyy format
-                        try:
-                            # Assume dd/mm/yyyy
-                            return datetime(
-                                int(groups[2]) if len(groups[2]) == 4 else 2000 + int(groups[2]),
-                                int(groups[1]),
-                                int(groups[0])
-                            ).strftime(output_format)
-                        except ValueError:
-                            continue
-            
             raise DateParsingError(f"Unable to parse date: {date_str}")
             
     except Exception as e:
@@ -213,28 +148,31 @@ async def extract_first_page(file_content: bytes) -> Optional[str]:
     """Extract first page from PDF and return as a thumbnail image in base64 encoded string."""
     def _extract():
         try:
-            logger.info(f"Starting PDF first page extraction for document of size {len(file_content)} bytes")
+            logger.info(f"Starting PDF first page extraction with content size: {len(file_content)} bytes")
             
             # Convert first page to image with specific DPI setting
             images = convert_from_bytes(
                 file_content,
                 first_page=1,  # pdf2image uses 1-based indexing
                 last_page=1,
-                dpi=200,  # Increased DPI for better quality
-                fmt='PNG',
-                poppler_path=None  # Set this to your poppler path if needed
+                dpi=200,
+                fmt='PNG'
             )
             
             if not images:
                 logger.error("No images were converted from PDF")
                 return None
             
+            logger.info(f"Successfully converted PDF to {len(images)} images")
+            
             # Get the first image
             first_page = images[0]
+            logger.info(f"First page original size: {first_page.size}")
             
             # Create thumbnail with specific size while maintaining aspect ratio
-            max_size = (800, 800)  # Increased size for better visibility
+            max_size = (800, 800)
             first_page.thumbnail(max_size, Image.Resampling.LANCZOS)
+            logger.info(f"Thumbnail size after resize: {first_page.size}")
             
             # Save thumbnail to bytes buffer with optimal compression
             img_buffer = io.BytesIO()
@@ -242,30 +180,22 @@ async def extract_first_page(file_content: bytes) -> Optional[str]:
                 img_buffer,
                 format='PNG',
                 optimize=True,
-                quality=85  # Adjust quality for better compression
+                quality=85
             )
             img_buffer.seek(0)
             
             # Convert to base64
             thumbnail = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+            logger.info(f"Generated thumbnail of size: {len(thumbnail)} bytes")
             
-            if not thumbnail:
-                logger.error("Generated thumbnail is empty")
-                return None
-                
-            logger.info(f"Successfully generated thumbnail of size: {len(thumbnail)} bytes")
             return thumbnail
                 
         except Exception as e:
             logger.error(f"PDF extraction error: {str(e)}", exc_info=True)
-            raise Exception(f"Failed to generate thumbnail: {str(e)}")
+            return None
 
-    try:
-        return await asyncio.get_event_loop().run_in_executor(executor, _extract)
-    except Exception as e:
-        logger.error(f"Thumbnail generation failed: {str(e)}")
-        return None
-    
+    return await asyncio.get_event_loop().run_in_executor(executor, _extract)
+
 async def process_form_recognizer(file_content: bytes, filename: str) -> Dict:
     """Process document with Form Recognizer and map field names."""
     try:
@@ -285,7 +215,6 @@ async def process_form_recognizer(file_content: bytes, filename: str) -> Dict:
                     mapped_key = FIELD_MAPPINGS[key]
                     value = kv_pair.value.content.strip()
                     
-                    # Apply date standardization for Date Filed field
                     if mapped_key == "Date Filed":
                         try:
                             value = standardize_date_format(value)
@@ -297,16 +226,12 @@ async def process_form_recognizer(file_content: bytes, filename: str) -> Dict:
                         'value': value,
                         'confidence': getattr(kv_pair, 'confidence', None)
                     }
-                    logger.info(f"Mapped '{key}' to '{mapped_key}' with value: {extracted_data[mapped_key]}")
         
         return extracted_data
 
     except Exception as e:
         logger.error(f"Form recognizer error for {filename}: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Form recognizer processing failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/process-document")
 async def process_document(
@@ -317,13 +242,9 @@ async def process_document(
     """Process a single document with optimized concurrent processing."""
     try:
         logger.info(f"Processing single document: {file.filename}")
-        logger.info(f"Content type: {file.content_type}")
         
         file_content = await file.read()
-        logger.info(f"File size: {len(file_content)} bytes")
-        
         metadata_dict = json.loads(metadata)
-        logger.info(f"Metadata: {metadata_dict}")
         
         # Process form recognition and first page extraction concurrently
         extracted_data_task = process_form_recognizer(file_content, file.filename)
@@ -335,6 +256,9 @@ async def process_document(
             thumbnail_task
         )
         
+        if thumbnail is None:
+            logger.warning(f"Thumbnail generation failed for {file.filename}")
+        
         response_data = {
             "filename": file.filename,
             "extracted_data": extracted_data,
@@ -342,10 +266,14 @@ async def process_document(
             "metadata": metadata_dict
         }
         
-        logger.info(f"Successfully processed document: {file.filename}")
-        logger.info(f"Extracted fields: {list(extracted_data.keys())}")
-        
-        return response_data
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
     
     except Exception as e:
         logger.error(f"Error processing document {file.filename}: {str(e)}", exc_info=True)
@@ -357,13 +285,9 @@ async def process_documents_batch(
     metadata: str = Form(...),
     token: str = Form(...)
 ):
-    """Process multiple documents concurrently with optimized batch processing."""
+    """Process multiple documents concurrently."""
     if len(files) > 10:
-        logger.warning(f"Batch size {len(files)} exceeds maximum limit of 10")
-        raise HTTPException(
-            status_code=400,
-            detail="Maximum batch size is 10 documents"
-        )
+        raise HTTPException(status_code=400, detail="Maximum batch size is 10 documents")
     
     try:
         logger.info(f"Processing batch of {len(files)} documents")
@@ -371,10 +295,7 @@ async def process_documents_batch(
         
         async def process_single_document(file: UploadFile):
             try:
-                logger.info(f"Processing batch document: {file.filename}")
                 file_content = await file.read()
-                
-                # Process form recognition and first page extraction concurrently
                 extracted_data_task = process_form_recognizer(file_content, file.filename)
                 thumbnail_task = extract_first_page(file_content)
                 
@@ -391,32 +312,59 @@ async def process_documents_batch(
                     "status": "success"
                 }
             except Exception as e:
-                logger.error(f"Error processing {file.filename}: {str(e)}", exc_info=True)
+                logger.error(f"Error processing {file.filename}: {str(e)}")
                 return {
                     "filename": file.filename,
                     "status": "error",
                     "error": str(e)
                 }
         
-        # Process all documents concurrently
         tasks = [process_single_document(file) for file in files]
         results = await asyncio.gather(*tasks)
         
-        successful = len([r for r in results if r.get("status") == "success"])
-        failed = len([r for r in results if r.get("status") == "error"])
-        
-        logger.info(f"Batch processing completed. Successful: {successful}, Failed: {failed}")
-        
-        return {
+        response_data = {
             "batch_size": len(files),
             "results": results,
-            "successful": successful,
-            "failed": failed
+            "successful": len([r for r in results if r.get("status") == "success"]),
+            "failed": len([r for r in results if r.get("status") == "error"])
         }
         
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+                "Access-Control-Allow-Headers": "*"
+            }
+        )
+        
     except Exception as e:
-        logger.error(f"Batch processing error: {str(e)}", exc_info=True)
+        logger.error(f"Batch processing error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.options("/api/process-document")
+async def options_process_document():
+    """Handle preflight requests for the process-document endpoint."""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
+@app.options("/api/process-documents-batch")
+async def options_process_documents_batch():
+    """Handle preflight requests for the batch processing endpoint."""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
 
 @app.get("/health")
 async def health_check():
@@ -426,11 +374,7 @@ async def health_check():
         credential = document_analysis_client.credential
         
         # Test date parsing functionality
-        test_dates = [
-            "2024-01-01",
-            "01/01/24",
-            "January 1, 2024"
-        ]
+        test_dates = ["2024-01-01", "01/01/24", "January 1, 2024"]
         date_parsing_status = all(
             standardize_date_format(date) for date in test_dates
         )
@@ -443,10 +387,7 @@ async def health_check():
         }
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Service unhealthy: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Service unhealthy: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
@@ -455,6 +396,5 @@ if __name__ == "__main__":
         app, 
         host="0.0.0.0", 
         port=8000,
-        log_level="info",
-        # reload=True  # Enable auto-reload during development
+        log_level="info"
     )
